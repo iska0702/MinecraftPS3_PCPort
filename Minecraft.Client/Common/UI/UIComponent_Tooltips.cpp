@@ -2,7 +2,15 @@
 #include "UI.h"
 #include "UIComponent_Tooltips.h"
 #ifdef _WINDOWS64
+#include "..\..\Minecraft.h"
+#include "..\..\Textures.h"
+#include "..\..\BufferedImage.h"
+#include "..\..\Tesselator.h"
+#include "..\..\Windows64\UI\PCPS3Icons.inl"
+#endif
+#ifdef _WINDOWS64
 extern bool g_pcUsingGamepad;
+extern bool g_pcPlayStationConnected;
 extern unsigned int g_pcInputGeneration;
 #endif
 
@@ -11,6 +19,7 @@ UIComponent_Tooltips::UIComponent_Tooltips(int iPad, void *initData, UILayer *pa
 #ifdef _WINDOWS64
 	m_pcInputGeneration = (unsigned int)-1;
 	m_pcLastMenuState = false;
+	m_pcTooltipOpacity = 1.0f;
 #endif
 	for(int i=0;i<XUSER_MAX_COUNT;i++)
 	{
@@ -202,6 +211,9 @@ void UIComponent_Tooltips::tick()
 		}
 		fVal=0.01f*(float)ucAlpha;
 	}
+#ifdef _WINDOWS64
+	m_pcTooltipOpacity = fVal;
+#endif
 	setOpacity(fVal);
 }
 
@@ -280,6 +292,10 @@ void UIComponent_Tooltips::render(S32 width, S32 height, C4JRender::eViewportTyp
 	else
 	{
 		UIScene::render(width, height, viewport);
+#ifdef _WINDOWS64
+		if (g_pcUsingGamepad && g_pcPlayStationConnected)
+			renderPCPlayStationIcons(width, height, viewport);
+#endif
 	}
 }
 
@@ -543,6 +559,91 @@ void UIComponent_Tooltips::overrideSFX(int iPad, int key, bool bVal)
 }
 
 #ifdef _WINDOWS64
+void UIComponent_Tooltips::renderPCPlayStationIcons(S32 width, S32 height, C4JRender::eViewportType viewport)
+{
+	if (!getMovie() || !m_hasTickedOnce || m_bIsReloading || m_movieWidth <= 0 || m_movieHeight <= 0 ||
+		viewport != C4JRender::VIEWPORT_TYPE_FULLSCREEN) return;
+
+	struct IconRect { float x, y, width, height; bool valid; } rects[eToolTipNumButtons] = {};
+	static const char *names[] = {"Button_A", "Button_B", "Button_X", "Button_Y", "Button_LT", "Button_RightTrigger", "Button_LeftBumper", "Button_RightBumper", "Button_LeftStick"};
+	int fittedWidth = width, fittedHeight = height;
+	if ((__int64)width * m_movieHeight > (__int64)height * m_movieWidth)
+		fittedWidth = height * m_movieWidth / m_movieHeight;
+	else
+		fittedHeight = width * m_movieHeight / m_movieWidth;
+	float sx = (float)fittedWidth / m_movieWidth, sy = (float)fittedHeight / m_movieHeight;
+	float originX = (width - fittedWidth) * 0.5f, originY = (height - fittedHeight) * 0.5f;
+	bool any = false;
+	for (unsigned int i = 0; i < eToolTipNumButtons; ++i)
+	{
+		if (!m_tooltipValues[i].show) continue;
+		IggyValuePath button, icon;
+		F64 bx, by, ix, iy, iw, ih, scaleX = 1.0, scaleY = 1.0;
+		if (!IggyValuePathMakeNameRef(&button, IggyPlayerRootPath(getMovie()), names[i]) ||
+			!IggyValuePathMakeNameRef(&icon, &button, "m_mcToolTip") ||
+			IggyValueGetF64RS(&button, 0, "x", &bx) != IGGY_RESULT_SUCCESS ||
+			IggyValueGetF64RS(&button, 0, "y", &by) != IGGY_RESULT_SUCCESS ||
+			IggyValueGetF64RS(&icon, 0, "x", &ix) != IGGY_RESULT_SUCCESS ||
+			IggyValueGetF64RS(&icon, 0, "y", &iy) != IGGY_RESULT_SUCCESS ||
+			IggyValueGetF64RS(&icon, 0, "width", &iw) != IGGY_RESULT_SUCCESS ||
+			IggyValueGetF64RS(&icon, 0, "height", &ih) != IGGY_RESULT_SUCCESS || iw <= 0 || ih <= 0) continue;
+		IggyValueGetF64RS(&button, 0, "scaleX", &scaleX);
+		IggyValueGetF64RS(&button, 0, "scaleY", &scaleY);
+		rects[i].x = originX + (float)(bx + ix * scaleX) * sx;
+		rects[i].y = originY + (float)(by + iy * scaleY) * sy;
+		rects[i].width = (float)(iw * scaleX) * sx;
+		rects[i].height = (float)(ih * scaleY) * sy;
+		rects[i].valid = true;
+		any = true;
+	}
+	if (!any) return;
+
+	static int textureIds[eToolTipNumButtons] = {0};
+	Textures *textures = Minecraft::GetInstance()->textures;
+	for (unsigned int i = 0; i < eToolTipNumButtons; ++i)
+	{
+		if (!rects[i].valid || textureIds[i]) continue;
+		// Textures retains the BufferedImage pointer for its lifetime.
+		BufferedImage *image = new BufferedImage(pcPS3Images[i], pcPS3ImageSizes[i]);
+		if (image->getData()) textureIds[i] = textures->getTexture(image, C4JRender::TEXTURE_FORMAT_RxGyBzAw, false);
+		else delete image;
+	}
+
+	ui.setupCustomDrawGameState();
+	// Iggy leaves a fitted 16:9 viewport active. Our rectangles are in full
+	// back-buffer coordinates, so use a matching viewport for the overlay.
+	extern ID3D11DeviceContext *g_pImmediateContext;
+	D3D11_VIEWPORT fullViewport = {0};
+	fullViewport.Width = (FLOAT)width;
+	fullViewport.Height = (FLOAT)height;
+	fullViewport.MinDepth = 0.0f;
+	fullViewport.MaxDepth = 1.0f;
+	g_pImmediateContext->RSSetViewports(1, &fullViewport);
+	glMatrixMode(GL_MODELVIEW);
+	glLoadIdentity();
+	glTranslatef(0, 0, -2000);
+	glDisable(GL_DEPTH_TEST);
+	glEnable(GL_TEXTURE_2D);
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	glColor4f(1, 1, 1, m_pcTooltipOpacity);
+	Tesselator *t = Tesselator::getInstance();
+	for (unsigned int i = 0; i < eToolTipNumButtons; ++i)
+	{
+		if (!rects[i].valid || !textureIds[i]) continue;
+		textures->bind(textureIds[i]);
+		float x = rects[i].x, y = rects[i].y, w = rects[i].width, h = rects[i].height;
+		t->begin();
+		t->vertexUV(x, y + h, 0, 0, 1);
+		t->vertexUV(x + w, y + h, 0, 1, 1);
+		t->vertexUV(x + w, y, 0, 1, 0);
+		t->vertexUV(x, y, 0, 0, 0);
+		t->end();
+	}
+	glDisable(GL_BLEND);
+	ui.endCustomDrawGameState();
+}
+
 void UIComponent_Tooltips::updatePCInputIcons()
 {
 	// Iggy movies contain gamepad artwork inside each tooltip's m_mcToolTip clip.
@@ -552,7 +653,7 @@ void UIComponent_Tooltips::updatePCInputIcons()
 		IggyValuePath button, icon;
 		if (IggyValuePathMakeNameRef(&button, IggyPlayerRootPath(getMovie()), names[i]) &&
 			IggyValuePathMakeNameRef(&icon, &button, "m_mcToolTip"))
-			IggyValueSetBooleanRS(&icon, 0, "visible", g_pcUsingGamepad);
+			IggyValueSetBooleanRS(&icon, 0, "visible", g_pcUsingGamepad && !g_pcPlayStationConnected);
 	}
 }
 #endif

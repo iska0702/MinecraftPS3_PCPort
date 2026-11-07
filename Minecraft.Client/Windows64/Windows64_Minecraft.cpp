@@ -4,7 +4,15 @@
 #include "stdafx.h"
 #include <Xinput.h>
 #include <ShlObj.h>
+#include <dxgi1_2.h>
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "dxgi.lib")
+
+// These exports ask hybrid-graphics drivers to prefer the discrete GPU.
+extern "C" {
+	__declspec(dllexport) DWORD NvOptimusEnablement = 1;
+	__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
 
 #include <assert.h>
 #include "GameConfig\Minecraft.spa.h"
@@ -320,16 +328,67 @@ void PCGetCanvasSize(int &width, int &height)
 }
 bool g_pcCursorHidden = false;
 bool g_pcUsingGamepad = false;
+volatile LONG g_pcRawMouseX = 0, g_pcRawMouseY = 0;
+bool g_pcRawMouseRegistered = false;
+bool g_pcPlayStationConnected = false;
+namespace PCSonyPad { static bool IsAvailable(); }
 int g_pcFov = 70;
 unsigned int g_pcInputGeneration = 0;
+DWORD g_pcLastKeyboardMouseInput = 0;
 
 void PCSetInputDevice(bool gamepad)
 {
+	if (!gamepad) g_pcLastKeyboardMouseInput = GetTickCount();
 	if (gamepad != g_pcUsingGamepad) { g_pcUsingGamepad = gamepad; ++g_pcInputGeneration; }
 }
 
+// Detect physical Sony pads separately from XInput. A compatibility driver can
+// expose the same pad as an Xbox device, but the controls artwork should still
+// use the PlayStation 3 layout when the original Sony device is visible.
+void PCDetectPlayStationController()
+{
+	UINT count = 0;
+	if (GetRawInputDeviceList(NULL, &count, sizeof(RAWINPUTDEVICELIST)) != 0) return;
+	std::vector<RAWINPUTDEVICELIST> devices(count);
+	if (count && GetRawInputDeviceList(&devices[0], &count, sizeof(RAWINPUTDEVICELIST)) == (UINT)-1) return;
+	bool found = PCSonyPad::IsAvailable();
+	for (UINT i = 0; !found && i < count; ++i)
+	{
+		if (devices[i].dwType != RIM_TYPEHID) continue;
+		RID_DEVICE_INFO info = {0};
+		info.cbSize = sizeof(info);
+		UINT size = sizeof(info);
+		if (GetRawInputDeviceInfoW(devices[i].hDevice, RIDI_DEVICEINFO, &info, &size) == (UINT)-1) continue;
+		if (info.hid.dwVendorId != 0x054c || info.hid.usUsagePage != 1 ||
+			(info.hid.usUsage != 4 && info.hid.usUsage != 5)) continue;
+		switch (info.hid.dwProductId)
+		{
+		case 0x0268: // DualShock 3 / Sixaxis
+		case 0x05c4: case 0x09cc: // DualShock 4
+		case 0x0ce6: case 0x0df2: // DualSense and DualSense Edge
+			found = true;
+			break;
+		}
+		if (found) break;
+	}
+	if (found != g_pcPlayStationConnected)
+	{
+		g_pcPlayStationConnected = found;
+		++g_pcInputGeneration;
+	}
+}
+
+#include "PCGamepadSDL.inl"
+
 void PCPollGamepad()
 {
+	static DWORD lastSonyCheck = 0;
+	DWORD now = GetTickCount();
+	if (!lastSonyCheck || now - lastSonyCheck >= 1000)
+	{
+		PCDetectPlayStationController();
+		lastSonyCheck = now;
+	}
 	static XINPUT_GAMEPAD last = {0};
 	static bool wasConnected = false;
 	XINPUT_STATE state = {0};
@@ -346,8 +405,18 @@ void PCPollGamepad()
 	if (abs(current.sThumbRY) < XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE) current.sThumbRY = 0;
 	if (current.bLeftTrigger < XINPUT_GAMEPAD_TRIGGER_THRESHOLD) current.bLeftTrigger = 0;
 	if (current.bRightTrigger < XINPUT_GAMEPAD_TRIGGER_THRESHOLD) current.bRightTrigger = 0;
-	bool active = current.wButtons || current.bLeftTrigger || current.bRightTrigger || current.sThumbLX || current.sThumbLY || current.sThumbRX || current.sThumbRY;
-	if (GetForegroundWindow() == g_hWnd && active && memcmp(&current, &last, sizeof(current)) != 0) PCSetInputDevice(true);
+	// Ignore small stick/trigger fluctuations after a keyboard or mouse event.
+	// A new button or trigger press still switches immediately to the gamepad.
+	bool buttonPressed = (current.wButtons & ~last.wButtons) != 0;
+	bool triggerPressed = (current.bLeftTrigger >= 128 && last.bLeftTrigger < 128) ||
+		(current.bRightTrigger >= 128 && last.bRightTrigger < 128);
+	const int switchDeadzone = 18000;
+	bool stickMoved = (abs(current.sThumbLX) > switchDeadzone && abs(last.sThumbLX) <= switchDeadzone) ||
+		(abs(current.sThumbLY) > switchDeadzone && abs(last.sThumbLY) <= switchDeadzone) ||
+		(abs(current.sThumbRX) > switchDeadzone && abs(last.sThumbRX) <= switchDeadzone) ||
+		(abs(current.sThumbRY) > switchDeadzone && abs(last.sThumbRY) <= switchDeadzone);
+	bool mouseSettled = !g_pcLastKeyboardMouseInput || now - g_pcLastKeyboardMouseInput >= 350;
+	if (GetForegroundWindow() == g_hWnd && (buttonPressed || triggerPressed || (mouseSettled && stickMoved))) PCSetInputDevice(true);
 	last = current; wasConnected = true;
 }
 wchar_t g_pcGraphicsPath[MAX_PATH] = {0};
@@ -480,6 +549,29 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 	switch (message)
 	{
+	case WM_INPUT:
+		{
+			RAWINPUT raw;
+			UINT size = sizeof(raw);
+			UINT bytes = GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, &raw, &size,
+				sizeof(RAWINPUTHEADER));
+			if (bytes != (UINT)-1 && bytes >= sizeof(RAWINPUTHEADER) + sizeof(RAWMOUSE) &&
+				raw.header.dwType == RIM_TYPEMOUSE &&
+				!(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) && GetForegroundWindow() == hWnd)
+			{
+				LONG dx = raw.data.mouse.lLastX, dy = raw.data.mouse.lLastY;
+				if (dx || dy)
+				{
+					PCSetInputDevice(false);
+					if (app.GetGameStarted() && !ui.GetMenuDisplayed(0))
+					{
+						InterlockedExchangeAdd(&g_pcRawMouseX, dx);
+						InterlockedExchangeAdd(&g_pcRawMouseY, dy);
+					}
+				}
+			}
+			return DefWindowProc(hWnd, message, wParam, lParam);
+		}
 	case WM_KEYDOWN:
 	case WM_SYSKEYDOWN:
 		if (GetForegroundWindow() == hWnd) PCSetInputDevice(false);
@@ -605,6 +697,12 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
 		return FALSE;
 	}
 
+	RAWINPUTDEVICE mouseDevice = {0};
+	mouseDevice.usUsagePage = 1;
+	mouseDevice.usUsage = 2;
+	mouseDevice.hwndTarget = g_hWnd;
+	g_pcRawMouseRegistered = RegisterRawInputDevices(&mouseDevice, 1, sizeof(mouseDevice)) != FALSE;
+
 	ShowWindow(g_hWnd, nCmdShow);
 	UpdateWindow(g_hWnd);
 
@@ -710,13 +808,56 @@ app.DebugPrintf("width: %d, height: %d\n", width, height);
 	sd.SampleDesc.Quality = 0;
 	sd.Windowed = g_pcDisplayMode != 2;
 
-	for( UINT driverTypeIndex = 0; driverTypeIndex < numDriverTypes; driverTypeIndex++ )
+	// On hybrid laptops the display may be wired to the integrated GPU. Choose
+	// the render adapter independently; Windows will present to the display.
+	// DXGI 1.1 is available to the project's v110 toolset, so prefer hardware
+	// with the most dedicated video memory and try the remaining adapters too.
+	struct PCAdapterCandidate { IDXGIAdapter1 *adapter; SIZE_T dedicatedBytes; };
+	std::vector<PCAdapterCandidate> adapters;
+	IDXGIFactory1 *factory = NULL;
+	hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void **>(&factory));
+	if (SUCCEEDED(hr))
+	{
+		for (UINT index = 0; ; ++index)
+		{
+			IDXGIAdapter1 *adapter = NULL;
+			if (factory->EnumAdapters1(index, &adapter) == DXGI_ERROR_NOT_FOUND) break;
+			if (!adapter) break;
+			DXGI_ADAPTER_DESC1 desc = {0};
+			if (SUCCEEDED(adapter->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE))
+			{
+				PCAdapterCandidate candidate = {adapter, desc.DedicatedVideoMemory};
+				std::vector<PCAdapterCandidate>::iterator at = adapters.begin();
+				while (at != adapters.end() && at->dedicatedBytes >= candidate.dedicatedBytes) ++at;
+				adapters.insert(at, candidate);
+			}
+			else adapter->Release();
+		}
+		factory->Release();
+	}
+	hr = E_FAIL;
+	for (size_t index = 0; index < adapters.size() && FAILED(hr); ++index)
+	{
+		hr = D3D11CreateDeviceAndSwapChain(adapters[index].adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL,
+			createDeviceFlags, featureLevels, numFeatureLevels, D3D11_SDK_VERSION, &sd,
+			&g_pSwapChain, &g_pd3dDevice, &g_featureLevel, &g_pImmediateContext);
+		if (SUCCEEDED(hr))
+		{
+			g_driverType = D3D_DRIVER_TYPE_HARDWARE;
+			DXGI_ADAPTER_DESC1 selected = {0};
+			if (SUCCEEDED(adapters[index].adapter->GetDesc1(&selected)))
+				app.DebugPrintf("Selected GPU: %ls\n", selected.Description);
+		}
+	}
+	for (size_t index = 0; index < adapters.size(); ++index) adapters[index].adapter->Release();
+
+	// Retain the original default-hardware and software fallbacks if enumeration
+	// or explicit hardware device creation fails.
+	for (UINT driverTypeIndex = 0; FAILED(hr) && driverTypeIndex < numDriverTypes; ++driverTypeIndex)
 	{
 		g_driverType = driverTypes[driverTypeIndex];
-		hr = D3D11CreateDeviceAndSwapChain( NULL, g_driverType, NULL, createDeviceFlags, featureLevels, numFeatureLevels,
-			D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &g_featureLevel, &g_pImmediateContext );
-		if( HRESULT_SUCCEEDED( hr ) )
-			break;
+		hr = D3D11CreateDeviceAndSwapChain(NULL, g_driverType, NULL, createDeviceFlags, featureLevels, numFeatureLevels,
+			D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &g_featureLevel, &g_pImmediateContext);
 	}
 	if( FAILED( hr ) )
 		return hr;
@@ -945,6 +1086,14 @@ int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
 	////////////////
 
 	// Set the number of possible joypad layouts that the user can switch between, and the number of actions
+	PCSonyPad::Initialize();
+	// SDL may register raw-input devices during initialization. Ensure the
+	// game's mouse registration still targets the game window afterwards.
+	RAWINPUTDEVICE pcMouseDevice = {0};
+	pcMouseDevice.usUsagePage = 1;
+	pcMouseDevice.usUsage = 2;
+	pcMouseDevice.hwndTarget = g_hWnd;
+	g_pcRawMouseRegistered = RegisterRawInputDevices(&pcMouseDevice, 1, sizeof(pcMouseDevice)) != FALSE;
 	InputManager.Initialise(1,3,MINECRAFT_ACTION_MAX, ACTION_MAX_MENU);
 
 	// Set the default joypad action mappings for Minecraft
@@ -1174,6 +1323,7 @@ int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
 
 		app.UpdateTime();
 		PIXBeginNamedEvent(0,"Input manager tick");
+		PCSonyPad::Tick();
 		InputManager.Tick();
 		PCPollGamepad();
 		PIXEndNamedEvent();
@@ -1401,6 +1551,7 @@ int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
 		if (frameElapsed < frameBudget) Sleep(frameBudget - frameElapsed);
 	}
 
+	PCSonyPad::Shutdown();
 	// Free resources, unregister custom classes, and exit.
 	//	app.Uninit();
 	g_pd3dDevice->Release();

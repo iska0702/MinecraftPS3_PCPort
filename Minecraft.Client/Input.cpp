@@ -124,32 +124,7 @@ void Input::tick(LocalPlayer *player)
         tx = ty = 0.0f;
     }
 	player->interpolateTurn(tx * abs(tx) * turnSpeed, ty * abs(ty) * turnSpeed);
-#ifdef _WINDOWS64
-	// Use relative cursor movement while playing; leave the cursor alone in menus.
-	static bool mouseCaptured = false;
-	extern bool g_pcUsingGamepad;
-	extern int g_pcMouseSensitivity, g_pcMouseInvert;
-	if (keyboardActive && !g_pcUsingGamepad)
-	{
-		RECT client; POINT center, cursor;
-		GetClientRect(g_hWnd, &client);
-		center.x = (client.left + client.right) / 2;
-		center.y = (client.top + client.bottom) / 2;
-		ClientToScreen(g_hWnd, &center);
-		if (mouseCaptured && GetCursorPos(&cursor))
-		{
-			float dx = (float)(cursor.x - center.x) * g_pcMouseSensitivity / 100.0f;
-			float dy = (float)(center.y - cursor.y) * g_pcMouseSensitivity / 100.0f;
-			if (!pMinecraft->localgameModes[iPad]->isInputAllowed(MINECRAFT_ACTION_LOOK_LEFT)) dx = 0;
-			if (!pMinecraft->localgameModes[iPad]->isInputAllowed(MINECRAFT_ACTION_LOOK_UP)) dy = 0;
-			if (g_pcMouseInvert) dy = -dy;
-			player->interpolateTurn(dx, dy);
-		}
-		if (!mouseCaptured || cursor.x != center.x || cursor.y != center.y) SetCursorPos(center.x, center.y);
-		mouseCaptured = true;
-	}
-	else mouseCaptured = false;
-#endif
+
         
     //jumping = controller.isButtonPressed(0);
 

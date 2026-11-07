@@ -1000,6 +1000,68 @@ int GameRenderer::getLightTexture(int iPad, Level *level)
 
 void GameRenderer::render(float a, bool bFirst)
 {
+#ifdef _WINDOWS64
+	// Poll relative mouse movement once per rendered frame instead of the
+	// 20 Hz simulation tick. turn() updates both rotation samples so the
+	// camera responds immediately without an extra interpolation delay.
+	static bool pcMouseCaptured = false;
+	extern HWND g_hWnd;
+	extern bool g_pcUsingGamepad;
+	extern int g_pcMouseSensitivity, g_pcMouseInvert;
+	extern bool g_pcRawMouseRegistered;
+	extern volatile LONG g_pcRawMouseX, g_pcRawMouseY;
+	if (mc->player && mc->player->GetXboxPad() == 0)
+	{
+		bool mouseActive = mc->level && mc->localgameModes[0] &&
+			GetForegroundWindow() == g_hWnd && !ui.GetMenuDisplayed(0);
+#ifndef _CONTENT_PACKAGE
+		mouseActive = mouseActive && !app.GetFreezePlayers();
+#endif
+		LONG rawX = InterlockedExchange(&g_pcRawMouseX, 0);
+		LONG rawY = InterlockedExchange(&g_pcRawMouseY, 0);
+		if (mouseActive && g_pcRawMouseRegistered)
+		{
+			// Never discard actual mouse motion because a gamepad was also active.
+			if (rawX || rawY) { extern void PCSetInputDevice(bool); PCSetInputDevice(false); }
+			float dx = (float)rawX * g_pcMouseSensitivity / 100.0f;
+			float dy = (float)-rawY * g_pcMouseSensitivity / 100.0f;
+			if (!mc->localgameModes[0]->isInputAllowed(MINECRAFT_ACTION_LOOK_LEFT)) dx = 0;
+			if (!mc->localgameModes[0]->isInputAllowed(MINECRAFT_ACTION_LOOK_UP)) dy = 0;
+			if (g_pcMouseInvert) dy = -dy;
+			mc->player->turn(dx, dy);
+			pcMouseCaptured = false;
+		}
+		else if (mouseActive && !g_pcUsingGamepad)
+		{
+			// Fallback for systems where Raw Input registration failed.
+			RECT client;
+			POINT center, cursor;
+			if (GetClientRect(g_hWnd, &client))
+			{
+				center.x = (client.left + client.right) / 2;
+				center.y = (client.top + client.bottom) / 2;
+				if (ClientToScreen(g_hWnd, &center) && GetCursorPos(&cursor))
+				{
+					if (pcMouseCaptured)
+					{
+						float dx = (float)(cursor.x - center.x) * g_pcMouseSensitivity / 100.0f;
+						float dy = (float)(center.y - cursor.y) * g_pcMouseSensitivity / 100.0f;
+						if (!mc->localgameModes[0]->isInputAllowed(MINECRAFT_ACTION_LOOK_LEFT)) dx = 0;
+						if (!mc->localgameModes[0]->isInputAllowed(MINECRAFT_ACTION_LOOK_UP)) dy = 0;
+						if (g_pcMouseInvert) dy = -dy;
+						mc->player->turn(dx, dy);
+					}
+					if (!pcMouseCaptured || cursor.x != center.x || cursor.y != center.y)
+						SetCursorPos(center.x, center.y);
+					pcMouseCaptured = true;
+				}
+				else pcMouseCaptured = false;
+			}
+			else pcMouseCaptured = false;
+		}
+		else pcMouseCaptured = false;
+	}
+#endif
 	if( _updateLightTexture && bFirst) updateLightTexture(a);
 	if (Display::isActive())
 	{

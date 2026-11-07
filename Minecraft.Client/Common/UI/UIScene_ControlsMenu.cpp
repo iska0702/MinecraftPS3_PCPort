@@ -12,7 +12,10 @@ UIScene_ControlsMenu::UIScene_ControlsMenu(int iPad, void *initData, UILayer *pa
 	IggyDataValue result;
 	IggyDataValue value[1];
 	value[0].type = IGGY_DATATYPE_number;
-#if defined(_XBOX) || defined(_WIN64)
+#if defined(_WINDOWS64)
+	extern bool g_pcPlayStationConnected;
+	value[0].number = g_pcPlayStationConnected ? (F64)2 : (F64)0;
+#elif defined(_XBOX) || defined(_WIN64)
 	value[0].number = (F64)0;
 #elif defined(_DURANGO)
 	value[0].number = (F64)1;

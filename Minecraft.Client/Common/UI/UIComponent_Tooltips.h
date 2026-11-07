@@ -9,7 +9,9 @@ private:
 #ifdef _WINDOWS64
 	unsigned int m_pcInputGeneration;
 	bool m_pcLastMenuState;
+	float m_pcTooltipOpacity;
 	void updatePCInputIcons();
+	void renderPCPlayStationIcons(S32 width, S32 height, C4JRender::eViewportType viewport);
 #endif
 
 protected:
